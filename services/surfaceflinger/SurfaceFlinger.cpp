@@ -65,6 +65,8 @@
 #include <renderengine/RenderEngine.h>
 #include <statslog.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <fstream>
 #include <ui/ColorSpace.h>
 #include <ui/DebugUtils.h>
 #include <ui/DisplayConfig.h>
@@ -812,13 +814,6 @@ void SurfaceFlinger::bootFinished()
     if (mWindowManager != 0) {
         mWindowManager->linkToDeath(static_cast<IBinder::DeathRecipient*>(this));
     }
-    sp<IBinder> input(defaultServiceManager()->getService(
-            String16("inputflinger")));
-    if (input == nullptr) {
-        ALOGE("Failed to link to input service");
-    } else {
-        mInputFlinger = interface_cast<IInputFlinger>(input);
-    }
 
     if (mVrFlinger) {
       mVrFlinger->OnBootFinished();
@@ -833,7 +828,15 @@ void SurfaceFlinger::bootFinished()
     LOG_EVENT_LONG(LOGTAG_SF_STOP_BOOTANIM,
                    ns2ms(systemTime(SYSTEM_TIME_MONOTONIC)));
 
-    static_cast<void>(schedule([this] {
+    sp<IBinder> input(defaultServiceManager()->getService(String16("inputflinger")));
+
+    static_cast<void>(schedule([=] {
+        if (input == nullptr) {
+            ALOGE("Failed to link to input service");
+        } else {
+            mInputFlinger = interface_cast<IInputFlinger>(input);
+        }
+
         readPersistentProperties();
         mPowerAdvisor.onBootFinished();
         mBootStage = BootStage::FINISHED;
@@ -1699,6 +1702,32 @@ status_t SurfaceFlinger::setDisplayElapseTime(const sp<DisplayDevice>& display) 
     return getHwComposer().setDisplayElapseTime(*display->getId(), timeStamp);
 }
 
+status_t SurfaceFlinger::isSupportedConfigSwitch(const sp<IBinder>& displayToken, int config) {
+    sp<DisplayDevice> display = nullptr;
+    {
+        Mutex::Autolock lock(mStateLock);
+        display = (getDisplayDeviceLocked(displayToken));
+    }
+
+    if (!display) {
+        ALOGE("Attempt to switch config %d for invalid display token %p", config,
+               displayToken.get());
+        return NAME_NOT_FOUND;
+    }
+#if (defined QTI_DISPLAY_CONFIG_ENABLED && defined VALIDATE_CONFIG_SWITCH)
+    const auto displayId = display->getId();
+    const auto hwcDisplayId = getHwComposer().fromPhysicalDisplayId(*displayId);
+    bool supported = false;
+    mDisplayConfigIntf->IsSupportedConfigSwitch(*hwcDisplayId, config, &supported);
+    if (!supported) {
+        ALOGW("Switching to config:%d is not supported", config);
+        return INVALID_OPERATION;
+    }
+#endif
+
+    return NO_ERROR;
+}
+
 status_t SurfaceFlinger::getDisplayedContentSample(const sp<IBinder>& displayToken,
                                                    uint64_t maxFrames, uint64_t timestamp,
                                                    DisplayedFrameStats* outStats) const {
@@ -2237,6 +2266,9 @@ void SurfaceFlinger::onMessageReceived(int32_t what, nsecs_t expectedVSyncTime) 
             break;
         }
     }
+#ifdef PASS_COMPOSITOR_PID
+    mDisplayExtnIntf->SendCompositorPid();
+#endif
 }
 
 void SurfaceFlinger::onMessageInvalidate(nsecs_t expectedVSyncTime) {
@@ -2526,6 +2558,7 @@ void SurfaceFlinger::onMessageRefresh() {
     // Store the present time just before calling to the composition engine so we could notify
     // the scheduler.
     const auto presentTime = systemTime();
+    dumpDrawCycle(true);
 
     {
         Mutex::Autolock lock(mStateLock);
@@ -2746,6 +2779,8 @@ void SurfaceFlinger::postComposition()
         }
         mAnimFrameTracker.advanceFrame();
     }
+
+    dumpDrawCycle(false);
 
     mTimeStats->incrementTotalFrames();
     if (mHadClientComposition) {
@@ -5152,6 +5187,11 @@ void SurfaceFlinger::setPowerMode(const sp<IBinder>& displayToken, int mode) {
 }
 
 status_t SurfaceFlinger::doDump(int fd, const DumpArgs& args, bool asProto) {
+    size_t numArgs = args.size();
+    if (numArgs && ((args[0] == String16("--file")) ||
+        (args[0] == String16("--allocated_buffers")))) {
+        return doDumpContinuous(fd, args);
+    }
     std::string result;
 
     IPCThreadState* ipc = IPCThreadState::self();
@@ -5192,7 +5232,13 @@ status_t SurfaceFlinger::doDump(int fd, const DumpArgs& args, bool asProto) {
                 (it->second)(args, asProto, result);
                 dumpLayers = false;
             } else if (!asProto) {
-                dumpAllLocked(args, result);
+                // selection of mini dumpsys (Format: adb shell dumpsys SurfaceFlinger --mini)
+                if (numArgs && ((args[0] == String16("--mini")))) {
+                    dumpMini(result);
+                    dumpLayers = false;
+                } else {
+                    dumpAllLocked(args, result);
+                }
             }
         }
 
@@ -5211,6 +5257,129 @@ status_t SurfaceFlinger::doDump(int fd, const DumpArgs& args, bool asProto) {
     }
     write(fd, result.c_str(), result.size());
     return NO_ERROR;
+}
+
+status_t SurfaceFlinger::doDumpContinuous(int fd, const DumpArgs& args) {
+    // Format: adb shell dumpsys SurfaceFlinger --file --no-limit
+    size_t numArgs = args.size();
+    status_t err = NO_ERROR;
+
+    if (args[0] == String16("--allocated_buffers")) {
+        std::string dumpsys;
+        GraphicBufferAllocator& alloc(GraphicBufferAllocator::get());
+        alloc.dump(dumpsys);
+        write(fd, dumpsys.c_str(), dumpsys.size());
+        return NO_ERROR;
+    }
+
+    Mutex::Autolock _l(mFileDump.lock);
+    // Same command is used to start and end dump.
+    mFileDump.running = !mFileDump.running;
+    // selection of full dumpsys or not (defualt, dumpsys will be minimum required)
+    // Format: adb shell dumpsys SurfaceFlinger --file --no-limit --full-dump
+    if (numArgs >= 3 && (args[2] == String16("--full-dump"))) {
+                 mFileDump.fullDump = true;
+    }
+    if (mFileDump.running) {
+        std::ofstream ofs;
+        ofs.open(mFileDump.name, std::ofstream::out | std::ofstream::trunc);
+        if (!ofs) {
+            mFileDump.running = false;
+            err = UNKNOWN_ERROR;
+        } else {
+            ofs.close();
+            mFileDump.position = 0;
+            if (numArgs >= 2 && (args[1] == String16("--no-limit"))) {
+            mFileDump.noLimit = true;
+            } else {
+                mFileDump.noLimit = false;
+            }
+        }
+    }
+
+    std::string result;
+    result += mFileDump.running ? "Start" : "End";
+    result += mFileDump.noLimit ? " unlimited" : " fixed limit";
+    result += " dumpsys to file : ";
+    result += mFileDump.name;
+    result += "\n";
+    write(fd, result.c_str(), result.size());
+
+    return NO_ERROR;
+}
+
+void SurfaceFlinger::dumpDrawCycle(bool prePrepare) {
+    Mutex::Autolock _l(mFileDump.lock);
+
+    // User might stop dump collection in middle of prepare & commit.
+    // Collect dumpsys again after commit and replace.
+    if (!mFileDump.running && !mFileDump.replaceAfterCommit) {
+        return;
+    }
+    Vector<String16> args;
+    std::string dumpsys;
+    {
+        Mutex::Autolock lock(mStateLock);
+        if (mFileDump.fullDump) {
+            dumpAllLocked(args, dumpsys);
+        } else {
+            dumpMini(dumpsys);
+        }
+    }
+
+    if (mFileDump.fullDump) {
+        const LayersProto layersProto = dumpDrawingStateProto(SurfaceTracing::TRACE_ALL);
+        const auto layerTree = LayerProtoParser::generateLayerTree(layersProto);
+        dumpsys.append(LayerProtoParser::layerTreeToString(layerTree));
+        dumpsys.append("\n");
+        dumpsys.append("Offscreen Layers:\n");
+        for (Layer* offscreenLayer : mOffscreenLayers) {
+            offscreenLayer->traverse(LayerVector::StateSet::Drawing,
+                                     [&](Layer* layer) {
+                                         layer->dumpCallingUidPid(dumpsys);
+                                     });
+        }
+    }
+
+    char timeStamp[32];
+    char dataSize[32];
+    char hms[32];
+    long millis;
+    struct timeval tv;
+    struct tm *ptm;
+    gettimeofday(&tv, NULL);
+    ptm = localtime(&tv.tv_sec);
+    strftime (hms, sizeof (hms), "%H:%M:%S", ptm);
+    millis = tv.tv_usec / 1000;
+    snprintf(timeStamp, sizeof(timeStamp), "Timestamp: %s.%03ld", hms, millis);
+    snprintf(dataSize, sizeof(dataSize), "Size: %8zu", dumpsys.size());
+    std::fstream fs;
+    fs.open(mFileDump.name, std::ios::app);
+    if (!fs) {
+        ALOGE("Failed to open %s file for dumpsys", mFileDump.name);
+        return;
+    }
+    // Format:
+    //    | start code | after commit? | time stamp | dump size | dump data |
+    fs.seekp(mFileDump.position, std::ios::beg);
+    fs << "#@#@-- DUMPSYS START --@#@#" << std::endl;
+    fs << "PostCommit: " << ( prePrepare ? "false" : "true" ) << std::endl;
+    fs << timeStamp << std::endl;
+    fs << dataSize << std::endl;
+    fs << dumpsys << std::endl;
+
+    if (prePrepare) {
+        mFileDump.replaceAfterCommit = true;
+    } else {
+        mFileDump.replaceAfterCommit = false;
+        // Reposition only after commit.
+        // Keep file size to appx 20 MB limit by default, wrap around if exceeds.
+        mFileDump.position = fs.tellp();
+        if (!mFileDump.noLimit && (mFileDump.position > (20 * 1024 * 1024))) {
+            mFileDump.position = 0;
+        }
+    }
+    fs.close();
 }
 
 status_t SurfaceFlinger::dumpCritical(int fd, const DumpArgs&, bool asProto) {
@@ -5520,6 +5689,42 @@ void SurfaceFlinger::dumpOffscreenLayers(std::string& result) {
                       }
                       return result;
                   }).get());
+}
+
+void SurfaceFlinger::dumpMini(std::string& result) const {
+    /*
+     *      * Dump Display state
+     *           */
+    StringAppendF(&result, "Displays (%zu entries)\n", mDisplays.size());
+    for (const auto& [token, display] : mDisplays) {
+        display->dump(result);
+    }
+    result.append("\n");
+
+    /*
+     * HWC layer minidump
+     */
+    for (const auto& [token, display] : mDisplays) {
+        const auto displayId = display->getId();
+        if (!displayId) {
+            continue;
+        }
+
+        StringAppendF(&result, "Display %s HWC layers:\n", to_string(*displayId).c_str());
+        Layer::miniDumpHeader(result);
+        const DisplayDevice& displayDevice = *display;
+        mCurrentState.traverseInZOrder(
+                [&](Layer* layer) { layer->miniDump(result, displayDevice); });
+        result.append("\n");
+    }
+
+    /*
+     * Dump HWComposer state
+     */
+    result.append("h/w composer state:\n");
+    bool hwcDisabled = mDebugDisableHWC || mDebugRegion;
+    StringAppendF(&result, "  h/w composer %s\n", hwcDisabled ? "disabled" : "enabled");
+    getHwComposer().dump(result);
 }
 
 void SurfaceFlinger::dumpAllLocked(const DumpArgs& args, std::string& result) const {
@@ -5836,9 +6041,9 @@ status_t SurfaceFlinger::CheckTransactCodeCredentials(uint32_t code) {
         code == IBinder::SYSPROPS_TRANSACTION) {
         return OK;
     }
-    // Numbers from 1000 to 1036 and 20000 are currently used for backdoors. The code
+    // Numbers from 1000 to 1036 and 20000 to 20002 are currently used for backdoors. The code
     // in onTransact verifies that the user is root, and has access to use SF.
-    if ((code >= 1000 && code <= 1036) || (code == 20000)) {
+    if ((code >= 1000 && code <= 1036) || (code >= 20000 && code <= 20002)) {
         ALOGV("Accessing SurfaceFlinger through backdoor code: %u", code);
         return OK;
     }
@@ -6160,6 +6365,9 @@ status_t SurfaceFlinger::onTransact(uint32_t code, const Parcel& data, Parcel* r
                 const auto numConfigs = mRefreshRateConfigs->getAllRefreshRates().size();
                 if ((n >= 0) && (n < numConfigs)) {
                     const auto displayToken = getInternalDisplayToken();
+                    if(isSupportedConfigSwitch(displayToken, n) != NO_ERROR) {
+                        return BAD_VALUE;
+                    }
                     status_t result = setActiveConfig(displayToken, n);
                     if (result != NO_ERROR) {
                         return result;
@@ -6181,11 +6389,161 @@ status_t SurfaceFlinger::onTransact(uint32_t code, const Parcel& data, Parcel* r
                 return NO_ERROR;
             }
             case 20000: {
-              uint64_t disp = data.readUint64();
-              int mode = data.readInt32();
-              ALOGI("Debug: Set display = %llu, power mode = %d", (unsigned long long)disp, mode);
-              setPowerMode(getPhysicalDisplayToken(disp), mode);
-              return NO_ERROR;
+                uint64_t disp = 0;
+                int32_t mode = HWC_POWER_MODE_NORMAL;
+                int32_t tile_h_loc = -1;
+                int32_t tile_v_loc = -1;
+                uint32_t num_h_tiles = 1;
+                uint32_t num_v_tiles = 1;
+                if (data.readUint64(&disp) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 64-bit unsigned-int display id parameter.");
+                    break;
+                }
+                if (data.readInt32(&mode) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 32-bit signed-int power mode parameter.");
+                    break;
+                }
+                if (data.readInt32(&tile_h_loc) != NO_ERROR) {
+                    tile_h_loc = -1;
+                }
+                if (data.readInt32(&tile_v_loc) != NO_ERROR) {
+                    tile_v_loc = 0;
+                }
+                if (tile_h_loc < 0) {
+                    ALOGI("Debug: Set display = %llu, power mode = %d", (unsigned long long)disp,
+                          mode);
+                    setPowerMode(getPhysicalDisplayToken(disp), mode);
+                } else {
+#if defined(QTI_DISPLAY_CONFIG_ENABLED) && defined(DISPLAY_CONFIG_TILE_DISPLAY_APIS_1_0)
+                    ::DisplayConfig::PowerMode hwcMode = ::DisplayConfig::PowerMode::kOff;
+                    switch (mode) {
+                        case HWC_POWER_MODE_DOZE:
+                            hwcMode = ::DisplayConfig::PowerMode::kDoze;
+                            break;
+                        case HWC_POWER_MODE_NORMAL:
+                            hwcMode = ::DisplayConfig::PowerMode::kOn;
+                            break;
+                        case HWC_POWER_MODE_DOZE_SUSPEND:
+                            hwcMode = ::DisplayConfig::PowerMode::kDozeSuspend;
+                            break;
+                        default:
+                            break;
+                    }
+                    // A regular display has one h tile and one v tile.
+                    mDisplayConfigIntf->GetDisplayTileCount(disp, &num_h_tiles, &num_v_tiles);
+                    if (((num_h_tiles * num_v_tiles) < 2) || tile_h_loc >= num_h_tiles
+                        || tile_v_loc >= num_v_tiles) {
+                        ALOGE("Debug: Display %llu has only %u h tiles and %u v tiles. Not a true "
+                              "tile display or invalid tile h or v locations given.",
+                              (unsigned long long)disp, num_h_tiles, num_v_tiles);
+                    } else {
+                        err = mDisplayConfigIntf->SetPowerModeTiled(disp, hwcMode, tile_h_loc,
+                                                                    tile_v_loc);
+                        if (NO_ERROR != err) {
+                            ALOGE("Debug: DisplayConfig::SetPowerModeTiled() returned error %d",
+                                  err);
+                            break;
+                        }
+                    }
+#endif
+                    ALOGI("Debug: Set display = %llu, power mode = %d at tile h loc = %d, tile v "
+                          "loc = %d (Has %u h tiles and %u v tiles)", (unsigned long long)disp,
+                          mode, tile_h_loc, tile_v_loc, num_h_tiles, num_v_tiles);
+                }
+                return NO_ERROR;
+            }
+            case 20001: {
+                uint64_t disp = 0;
+                int32_t level = 0;
+                int32_t tile_h_loc = -1;
+                int32_t tile_v_loc = -1;
+                uint32_t num_h_tiles = 1;
+                uint32_t num_v_tiles = 1;
+                if (data.readUint64(&disp) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 64-bit unsigned-int display id parameter.");
+                    break;
+                }
+                if (data.readInt32(&level) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 32-bit signed-int brightess parameter.");
+                    break;
+                }
+                float levelf = static_cast<float>(level)/255.0f;
+                if (data.readInt32(&tile_h_loc) != NO_ERROR) {
+                    tile_h_loc = -1;
+                }
+                if (data.readInt32(&tile_v_loc) != NO_ERROR) {
+                    tile_v_loc = 0;
+                }
+                if (tile_h_loc < 0) {
+                    ALOGI("Debug: Set display = %llu, brightness level = %d/255 (%0.2ff)",
+                          (unsigned long long)disp, level, levelf);
+                    setDisplayBrightness(getPhysicalDisplayToken(disp), levelf);
+                } else {
+#if defined(QTI_DISPLAY_CONFIG_ENABLED) && defined(DISPLAY_CONFIG_TILE_DISPLAY_APIS_1_0)
+                    // A regular display has one h tile and one v tile.
+                    mDisplayConfigIntf->GetDisplayTileCount(disp, &num_h_tiles, &num_v_tiles);
+                    if (((num_h_tiles * num_v_tiles) < 2) || tile_h_loc >= num_h_tiles
+                        || tile_v_loc >= num_v_tiles) {
+                        ALOGE("Debug: Display %llu has only %u h tiles and %u v tiles. Not a true "
+                              "tile display or invalid tile h or v locations given.",
+                              (unsigned long long)disp, num_h_tiles, num_v_tiles);
+                    } else {
+                        err = mDisplayConfigIntf->SetPanelBrightnessTiled(disp, level, tile_h_loc,
+                                                                          tile_v_loc);
+                        if (NO_ERROR != err) {
+                            ALOGE("Debug: DisplayConfig::SetPanelBrightnessTiled() returned error "
+                                  "%d", err);
+                            break;
+                        }
+                    }
+#endif
+                    ALOGI("Debug: Set display = %llu, brightness level = %d/255 (%0.2ff) at tile h "
+                          "loc = %d, tile v loc = %d (Has %u h tiles and %u v tiles)",
+                          (unsigned long long)disp, level, levelf, tile_h_loc, tile_v_loc,
+                          num_h_tiles, num_v_tiles);
+                }
+                return NO_ERROR;
+            }
+            case 20002: {
+                uint64_t disp = 0;
+                int32_t pref = 0;
+                if (data.readUint64(&disp) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 64-bit unsigned-int display id parameter.");
+                    break;
+                }
+                if (data.readInt32(&pref) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 32-bit signed-int wider-mode preference parameter.");
+                    break;
+                }
+                ALOGI("Debug: Set display = %llu, wider-mode preference = %d",
+                      (unsigned long long)disp, pref);
+#if defined(QTI_DISPLAY_CONFIG_ENABLED) && defined(DISPLAY_CONFIG_TILE_DISPLAY_APIS_1_0)
+                ::DisplayConfig::WiderModePref wider_mode_pref =
+                    ::DisplayConfig::WiderModePref::kNoPreference;
+                switch (pref) {
+                    case 1:
+                        wider_mode_pref = ::DisplayConfig::WiderModePref::kWiderAsyncMode;
+                        break;
+                    case 2:
+                        wider_mode_pref = ::DisplayConfig::WiderModePref::kWiderSyncMode;
+                        break;
+                    default:
+                        // Use default DisplayConfig::WiderModePref::kNoPreference.
+                        break;
+                }
+                err = mDisplayConfigIntf->SetWiderModePreference(disp, wider_mode_pref);
+                if (NO_ERROR != err) {
+                    ALOGE("Debug: DisplayConfig::SetWiderModePreference() returned error %d", err);
+                    break;
+                }
+#endif
+                return NO_ERROR;
             }
         }
     }
@@ -6835,7 +7193,7 @@ status_t SurfaceFlinger::setDesiredDisplayConfigSpecsInternal(
     LOG_ALWAYS_FATAL_IF(!policy && !overridePolicy, "Can only clear the override policy");
 
     if (!display->isPrimary()) {
-	return NO_ERROR;
+        return NO_ERROR;
 
         // TODO(b/144711714): For non-primary displays we should be able to set an active config
         // as well. For now, just call directly to setActiveConfigWithConstraints but ideally
